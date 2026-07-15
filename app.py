@@ -42,9 +42,26 @@ def handle_question(question: str) -> None:
     knowledge -> llm -> score -> review 순서로 각 모듈을 호출하고,
     결과를 st.session_state.history에 새 항목으로 추가한다.
 
+    다만 그 전에, 검수자가 예전에 이 질문을 "수정 후 승인"한 적이 있는지
+    먼저 확인한다(review.find_learned_answer). 있다면 knowledge/llm을
+    다시 거치지 않고 그 답변을 바로 재사용한다 - 검수자가 한 번 고친
+    내용이 다음에 같은 질문에도 반영되게 하기 위함이다.
+
     Parameters:
         question (str): 사용자가 입력한 질문
     """
+    # 0) 이전에 검수자가 고쳐서 승인한 적 있는 질문이면, 그 답변을 그대로 재사용한다.
+    learned_answer = review.find_learned_answer(question)
+    if learned_answer is not None:
+        st.session_state.history.append({
+            "question": question,
+            "context": "(이전에 검수자가 확인한 답변이라 학칙을 다시 검색하지 않았습니다.)",
+            "answer": learned_answer,
+            "score": 100,
+            "status": review.STATUS_LEARNED,
+        })
+        return
+
     # 1) 학칙 Markdown 문서에서 질문과 가장 관련 있는 문장(Context)을 찾는다.
     with st.spinner("학칙에서 관련 내용을 찾는 중..."):
         context = knowledge.get_context(question)
@@ -98,7 +115,7 @@ for idx, item in reversed(list(enumerate(st.session_state.history))):
         col1.metric("Confidence Score", f"{item['score']} / 100")
         col1.progress(item["score"] / 100)
 
-        if item["status"] in (review.STATUS_APPROVED, review.STATUS_MANUALLY_APPROVED):
+        if item["status"] in (review.STATUS_APPROVED, review.STATUS_MANUALLY_APPROVED, review.STATUS_LEARNED):
             col2.success(item["status"])
         elif item["status"] == review.STATUS_REJECTED:
             col2.error(item["status"])
