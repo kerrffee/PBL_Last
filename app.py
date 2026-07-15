@@ -89,24 +89,20 @@ def handle_question(question: str) -> None:
     })
 
 
-# ---------------- 질문 입력 영역 ----------------
-with st.form("question_form", clear_on_submit=True):
-    question_input = st.text_input("학칙에 대해 궁금한 점을 입력하세요.")
-    submitted = st.form_submit_button("질문하기")
+# 사용자/챗봇 말풍선에 쓸 아바타 아이콘 (일관성을 위해 상수로 고정)
+USER_AVATAR = "🙋"
+ASSISTANT_AVATAR = "📘"
 
-if submitted and question_input.strip():
-    handle_question(question_input.strip())
-
-st.divider()
-
-# ---------------- 대화 기록 / 검수 화면 ----------------
+# ---------------- 대화 기록 (채팅 형식) ----------------
 if not st.session_state.history:
-    st.info("아직 질문 기록이 없습니다. 위에 질문을 입력해 보세요.")
+    st.info("아직 질문 기록이 없습니다. 아래 입력창에 질문을 입력해 보세요.")
 
-# 최신 질문이 위쪽에 표시되도록 역순으로 순회한다.
-for idx, item in reversed(list(enumerate(st.session_state.history))):
-    with st.container(border=True):
-        st.markdown(f"**Q. {item['question']}**")
+# 채팅 UI는 시간 순서(오래된 것이 위, 최신이 아래)로 표시하는 것이 자연스럽다.
+for idx, item in enumerate(st.session_state.history):
+    with st.chat_message("user", avatar=USER_AVATAR):
+        st.markdown(item["question"])
+
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         st.write(item["answer"])
         if item.get("edited"):
             st.caption("✏️ 검수자가 답변을 수정했습니다.")
@@ -149,3 +145,10 @@ for idx, item in reversed(list(enumerate(st.session_state.history))):
             if col_reject.button("❌ 반려", key=f"reject_{idx}"):
                 review.reject_manually(item)
                 st.rerun()
+
+# ---------------- 질문 입력 영역 ----------------
+# st.chat_input은 어디에서 호출하든 Streamlit이 항상 화면 하단에 고정해서 보여준다.
+prompt = st.chat_input("학칙에 대해 궁금한 점을 입력하세요.")
+if prompt and prompt.strip():
+    handle_question(prompt.strip())
+    st.rerun()
