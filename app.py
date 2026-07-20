@@ -34,7 +34,18 @@ import review
 load_dotenv()
 REVIEWER_ACCESS_CODE = os.getenv("REVIEWER_ACCESS_CODE", "")
 
-st.set_page_config(page_title="학교 학칙 Q&A 챗봇", page_icon="📘")
+# 후속 질문("그건 며칠이야?" 등) 처리를 위해 대화 맥락으로 함께 넘길
+# 직전 턴의 개수. 너무 크게 잡으면 매 질문마다 LLM에 보내는 토큰이
+# 늘어나므로, 최근 몇 턴만 넘긴다.
+CONVERSATION_HISTORY_TURNS = 3
+
+st.set_page_config(
+    page_title="학교 학칙 Q&A 챗봇",
+    page_icon="📘",
+    # 검수자 모드 사이드바가 화면을 항상 크게 차지하지 않도록 기본은 접어둔다.
+    # 화면 왼쪽 위 작은 화살표 아이콘을 눌러 펼치고, 다시 눌러 접을 수 있다.
+    initial_sidebar_state="collapsed",
+)
 st.title("📘 학교 학칙 Q&A 챗봇")
 st.caption("data/school_rules.md 문서를 근거로 답변하는 문서 기반 Q&A 챗봇입니다.")
 
@@ -95,16 +106,29 @@ def handle_question(question: str) -> None:
         })
         return
 
+    # 대화 맥락: 지금까지 쌓인 기록 중 최근 몇 턴만 후속 질문 이해에 사용한다.
+    recent_history = st.session_state.history[-CONVERSATION_HISTORY_TURNS:]
+    recent_questions = [turn["question"] for turn in recent_history]
+
     # 1) 학칙 Markdown 문서에서 질문과 가장 관련 있는 문장(Context)을 찾는다.
+    #    현재 질문만으로 찾지 못하면, 직전 질문들의 키워드를 더해 다시 찾는다
+    #    (knowledge.get_context의 history_questions 인자 참고 - 후속 질문 대응).
     with st.spinner("학칙에서 관련 내용을 찾는 중..."):
-        context = knowledge.get_context(question)
+        context = knowledge.get_context(question, history_questions=recent_questions)
         print("===== CONTEXT =====")
         print(context)
         print("===================")
 
-    # 2) 질문 + Context를 함께 LLM에 전달해 답변을 생성한다.
+    # 2) 질문 + Context + 최근 대화 기록을 함께 LLM에 전달해 답변을 생성한다.
+    #    최근 대화 기록은 "그건 며칠이야?"처럼 이전 답변을 가리키는 질문을
+    #    이해하는 데 쓰이고, 답변의 사실적 근거는 여전히 Context에서만 온다.
+    # knowledge.get_context()가 동의어(예: "크록스"->"슬리퍼")로 찾은 문장은
+    # Context 원문에 질문 단어 자체가 없어서, 이 안내가 없으면 LLM이
+    # "찾을 수 없습니다"로 답하며 신뢰도 점수도 낮게 준다 (knowledge.get_synonym_note 참고).
+    synonym_note = knowledge.get_synonym_note(question)
+
     with st.spinner("답변을 생성하는 중..."):
-        answer = llm.generate_answer(question, context)
+        answer = llm.generate_answer(question, context, history=recent_history, synonym_note=synonym_note)
 
     # 3) LLM이 스스로 답변의 신뢰도(Confidence Score)를 평가한다.
     with st.spinner("답변의 신뢰도를 평가하는 중..."):

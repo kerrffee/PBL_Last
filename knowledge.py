@@ -132,6 +132,35 @@ SYNONYM_MAP = {
     "삼선슬리퍼": ["슬리퍼"],
 }
 
+# "그건", "그거"처럼 이전 대화의 주제를 가리키는 지시어 목록.
+#
+# [대화형 대응 - 지시어 질문 오매칭 문제] 후속 질문에 이런 지시어가 있으면,
+# 질문 자체의 키워드("최대", "며칠"처럼 일반적인 단어)만으로 검색했을 때
+# 우연히 전혀 다른 주제의 문장과 매칭되어도 "빈 Context"가 아니므로, 기존
+# 로직(현재 질문만으로 찾지 못했을 때만 history_questions를 더하는 방식)은
+# 이 오매칭을 잡아내지 못한다. (예: "그건 최대 며칠까지 가능해?"가 "휴학"이
+# 아니라 전혀 무관한 "학업중단숙려" 조항과 매칭되는 문제를 실제로 확인함)
+# 그래서 질문에 지시어가 있으면, 현재 질문 단독 검색 결과가 있더라도
+# 먼저 직전 질문 키워드를 더한 결합 검색을 우선 시도한다.
+REFERENTIAL_MARKERS = [
+    "그건", "그거", "그것", "그게", "저건", "저거", "저것",
+    "이건", "이거", "이것", "그럼", "그러면", "거기", "그때",
+]
+
+
+def _is_referential_question(question: str) -> bool:
+    """
+    질문이 "그건", "그거"처럼 이전 대화의 주제를 가리키는 지시어를
+    포함하는지 확인한다.
+
+    Parameters:
+        question (str): 사용자가 입력한 질문
+
+    Returns:
+        bool: 지시어가 하나라도 포함되어 있으면 True
+    """
+    return any(marker in question for marker in REFERENTIAL_MARKERS)
+
 # Markdown 파일을 매 질문마다 다시 읽고 문장을 다시 나누면 느려지기 때문에,
 # 최초 1회만 로드해서 이 변수에 캐싱해 둔다.
 _sentence_cache = None
@@ -330,6 +359,36 @@ def expand_with_synonyms(keywords: set) -> set:
     return expanded
 
 
+def get_synonym_note(question: str) -> str:
+    """
+    질문에 SYNONYM_MAP에 등록된 단어가 있으면, "질문 단어와 문서 단어가
+    같은 의미"라고 LLM에게 알려주는 안내 문장을 만든다.
+
+    [버그 수정] expand_with_synonyms()는 검색(Context 찾기) 단계에서만
+    쓰이고, 그 결과 찾아낸 Context 문장에는 "크록스"라는 단어 자체가
+    등장하지 않는다. 그래서 llm.generate_answer()가 질문("크록스")과
+    Context("슬리퍼")만 보면, 시스템 프롬프트의 "Context에 없는 사실을
+    지어내지 않는다" 규칙 때문에 "크록스"가 언급된 조항이 없다고 판단해
+    자신 없는 답변을 하게 된다 (Confidence Score도 함께 낮아짐).
+    이를 막기 위해 "질문 단어 = 문서 단어" 관계를 별도 안내 문장으로
+    만들어 llm.generate_answer()에 함께 전달한다.
+
+    Parameters:
+        question (str): 사용자가 입력한 질문
+
+    Returns:
+        str: "'크록스'는 '슬리퍼'/'운동화'와 같은 의미로 취급합니다." 같은
+             안내 문장들을 이어붙인 문자열. 등록된 동의어가 없으면 빈 문자열.
+    """
+    keywords = extract_keywords(question)
+    notes = []
+    for keyword in sorted(keywords):
+        if keyword in SYNONYM_MAP:
+            doc_words = "/".join(f"'{word}'" for word in SYNONYM_MAP[keyword])
+            notes.append(f"'{keyword}'는 {doc_words}와(과) 같은 의미로 취급합니다.")
+    return " ".join(notes)
+
+
 def _build_keyword_document_frequency(sentences: list) -> dict:
     """
     각 키워드가 전체 문장 중 몇 개의 문장에 등장하는지("문서 빈도")를 센다.
@@ -416,7 +475,53 @@ def _load_sentences() -> list:
     return _sentence_cache
 
 
-def get_context(question: str, top_n: int = 3) -> str:
+def _search_with_keywords(keywords: set, sentences: list, keyword_df: dict, top_n: int) -> str:
+    """
+    주어진 키워드 집합으로 문장들을 검색해 Context 문자열을 만드는 내부 함수.
+
+    get_context()의 3~5단계(유사도 계산 -> 정렬 -> top_n 선택)를 모아둔
+    것으로, 현재 질문만으로 검색할 때와 이전 질문 키워드를 더해 다시
+    검색할 때(후속 질문 대응) 양쪽에서 재사용한다.
+
+    Parameters:
+        keywords (set[str]): 검색에 사용할 키워드 집합 (이미 동의어 확장된 상태)
+        sentences (list[str]): 검색 대상 문장 리스트
+        keyword_df (dict[str, int]): 키워드별 문서 빈도
+        top_n (int): Context에 포함할 최대 문장 수
+
+    Returns:
+        str: 관련 문장들을 줄바꿈으로 이어붙인 Context 문자열.
+             관련 문장을 찾지 못하면 빈 문자열("")을 반환한다.
+    """
+    scored_sentences = [
+        (sentence, calculate_similarity(keywords, sentence, keyword_df))
+        for sentence in sentences
+    ]
+
+    # [핵심 버그 수정] 모든 문장의 점수가 0이라면 여기서 즉시 빈 문자열을
+    # 반환해야 한다. 그렇지 않으면 아래 sort()가 동점을 문서 순서 그대로
+    # 유지하기 때문에, 관련 없는 질문에도 항상 문서 맨 앞부분(제1조,
+    # 제2조...)이 선택되는 문제가 생긴다.
+    best_score = max(score for _, score in scored_sentences)
+    if best_score == 0:
+        return ""
+
+    scored_sentences.sort(key=lambda pair: pair[1], reverse=True)
+
+    # 상위 top_n개 중에서도 "0점 문장"과 "1등과 비교해 너무 점수 차이가
+    # 크게 나는 문장"을 걸러낸다. 1등 점수 대비 일정 비율(MIN_SCORE_RATIO)
+    # 미만이면 사실상 무관한 문장으로 보고 제외한다.
+    MIN_SCORE_RATIO = 0.3
+    score_threshold = best_score * MIN_SCORE_RATIO
+    top_sentences = [
+        s for s, sim_score in scored_sentences[:top_n]
+        if sim_score > 0 and sim_score >= score_threshold
+    ]
+
+    return "\n".join(top_sentences)
+
+
+def get_context(question: str, top_n: int = 3, history_questions: list = None) -> str:
     """
     사용자의 질문과 가장 관련성이 높은 문장(들)을 찾아,
     LLM에 전달할 Context 문자열로 반환하는 메인 함수.
@@ -430,17 +535,29 @@ def get_context(question: str, top_n: int = 3) -> str:
        (calculate_similarity).
     4. [정렬] 점수가 높은 순으로 정렬한다. 단, 정렬하기 전에 "가장 높은
        점수가 0인지"부터 확인해서, 관련 문장이 전혀 없으면 정렬/선택
-       단계로 가지 않고 즉시 빈 문자열을 반환한다. (이 확인이 없으면
-       모든 문장이 0점으로 동점일 때 Python 정렬의 특성상 문서 순서
-       그대로 top_n이 선택되는 버그가 발생한다 - 파일 상단 버그 수정
-       메모 참고)
+       단계로 가지 않고 즉시 빈 문자열을 반환한다.
     5. [top_n 선택] 정렬된 목록에서 점수가 0보다 크면서, 1등 점수 대비
        너무 낮지 않은(MIN_SCORE_RATIO 이상인) 문장만 최대 top_n개까지
        골라 하나의 문자열로 합쳐서 반환한다.
 
+    [대화형 대응] "그건 며칠이야?"처럼 질문 자체에 키워드가 거의 없거나
+    문서와 매칭되지 않는 후속 질문은, 위 단계만으로는 항상 빈 Context를
+    반환하게 된다. 이를 보완하기 위해 history_questions(직전 질문들)가
+    주어지면 직전 질문의 키워드를 더해 검색을 시도한다.
+
+    [지시어 질문 오매칭 문제] 다만 "그건 최대 며칠까지 가능해?"처럼 질문에
+    "최대", "며칠"같은 흔하지 않은 단어가 있으면, 그 단어만으로도 우연히
+    (원래 주제와 무관한) 다른 문장과 매칭되어 버려서 "빈 Context"가 아니게
+    될 수 있다. 이 경우 기존 방식(현재 질문만으로 못 찾았을 때만 history를
+    더하는 방식)은 오매칭을 잡아내지 못한다. 그래서 질문에 "그건", "그거"
+    같은 지시어(REFERENTIAL_MARKERS)가 있으면, 현재 질문 단독 검색이
+    성공하더라도 직전 질문 키워드를 더한 결합 검색을 먼저 시도한다.
+
     Parameters:
         question (str): 사용자가 입력한 질문
         top_n (int): Context에 포함할 최대 문장 수 (기본값 3)
+        history_questions (list[str] | None): 대화 맥락 보완용 직전 질문들
+            (오래된 것 -> 최근 순서 상관없음, 키워드 합집합만 사용한다)
 
     Returns:
         str: 관련 문장들을 줄바꿈으로 이어붙인 Context 문자열.
@@ -451,47 +568,36 @@ def get_context(question: str, top_n: int = 3) -> str:
     if not sentences:
         return ""
 
-    # 2) 키워드 추출 + 동의어 확장
-    question_keywords = extract_keywords(question)
-    question_keywords = expand_with_synonyms(question_keywords)
-    if not question_keywords:
-        return ""
-
-    # 3) 유사도 계산: (문장, 점수) 쌍의 리스트를 만든다.
-    #    키워드 문서 빈도(keyword_df)를 함께 넘겨 "학교"처럼 흔한 단어보다
-    #    "슬리퍼"처럼 드문 단어의 매칭에 더 높은 가중치를 준다.
     keyword_df = _load_keyword_df()
-    scored_sentences = [
-        (sentence, calculate_similarity(question_keywords, sentence, keyword_df))
-        for sentence in sentences
-    ]
 
-    # 4) 정렬하기 전, 관련 문장이 하나라도 있는지 먼저 확인한다.
-    #    [핵심 버그 수정] 모든 문장의 점수가 0이라면 여기서 즉시 빈
-    #    문자열을 반환해야 한다. 그렇지 않으면 아래 sort()가 동점을
-    #    문서 순서 그대로 유지하기 때문에, 관련 없는 질문에도 항상
-    #    문서 맨 앞부분(제1조, 제2조...)이 선택되는 문제가 생긴다.
-    best_score = max(score for _, score in scored_sentences)
-    if best_score == 0:
-        return ""
+    # 2) 키워드 추출 + 동의어 확장
+    question_keywords = expand_with_synonyms(extract_keywords(question))
 
-    # 점수 기준 내림차순 정렬 (이 시점에는 최소 하나의 문장이 0보다 큰 점수를 가짐)
-    scored_sentences.sort(key=lambda pair: pair[1], reverse=True)
+    combined_keywords = set(question_keywords)
+    if history_questions:
+        for prev_question in history_questions:
+            combined_keywords |= expand_with_synonyms(extract_keywords(prev_question))
+    has_history_boost = combined_keywords != question_keywords
 
-    # 5) top_n 선택: 상위 top_n개 중에서도 "0점 문장"과 "1등과 비교해 너무
-    #    점수 차이가 크게 나는 문장"을 걸러낸다.
-    #    가중치 적용 후에도 "학교"처럼 흔한 단어 하나만 겹치는 문장은
-    #    낮은 점수(예: 0.04)로 top_n 안에 딸려 들어올 수 있다. 1등 점수
-    #    대비 일정 비율(MIN_SCORE_RATIO) 미만이면 사실상 무관한 문장으로
-    #    보고 제외한다.
-    MIN_SCORE_RATIO = 0.3
-    score_threshold = best_score * MIN_SCORE_RATIO
-    top_sentences = [
-        s for s, sim_score in scored_sentences[:top_n]
-        if sim_score > 0 and sim_score >= score_threshold
-    ]
+    # 지시어가 있는 후속 질문은, 질문 단독 검색이 우연히 무관한 문장과
+    # 매칭될 위험이 있으므로 결합 검색을 먼저 시도한다.
+    if has_history_boost and _is_referential_question(question):
+        context = _search_with_keywords(combined_keywords, sentences, keyword_df, top_n)
+        if context:
+            return context
 
-    return "\n".join(top_sentences)
+    # 기본 순서: 현재 질문만으로 먼저 검색한다.
+    if question_keywords:
+        context = _search_with_keywords(question_keywords, sentences, keyword_df, top_n)
+        if context:
+            return context
+
+    # 현재 질문만으로는 관련 문장을 찾지 못한 경우, 직전 질문들의 키워드를
+    # 더해 다시 검색해본다 (후속 질문 대응).
+    if has_history_boost:
+        return _search_with_keywords(combined_keywords, sentences, keyword_df, top_n)
+
+    return ""
 
 
 # 이 파일을 직접 실행하면(python knowledge.py) 간단히 동작을 테스트할 수 있다.
